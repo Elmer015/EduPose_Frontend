@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { 
   LayoutDashboard, 
   Video, 
@@ -13,7 +13,6 @@ import {
   Calendar,
   CheckCircle,
   XCircle,
-  Eye,
   AlertCircle,
   User,
   Settings,
@@ -35,6 +34,16 @@ import {
   Legend,
   Filler
 } from 'chart.js';
+import {
+  buildTeacherProfile,
+  clearStoredSession,
+  listCollection,
+  loginRequest,
+  mergeBoxesFromStudents,
+  mergeStudentsFromBackend,
+  persistSession,
+  readStoredSession,
+} from './lib/backendApi';
 
 // Register Chart.js components
 ChartJS.register(
@@ -72,22 +81,87 @@ const INITIAL_WARNINGS = [
   { id: 3, studentId: 12, name: "Lulu Hernawan", desc: "Terdeteksi mengantuk", time: "12 menit lalu" }
 ];
 
+const WEB_SOCKET_URL = import.meta.env.VITE_WEBSOCKET_URL?.trim() ?? '';
+
+const formatAlertTime = (timestamp) => {
+  if (!timestamp) return 'Baru saja';
+
+  const parsedTime = new Date(timestamp);
+  if (Number.isNaN(parsedTime.getTime())) return 'Baru saja';
+
+  return parsedTime.toLocaleTimeString('id-ID', {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+};
+
+const normalizeWebSocketWarning = (payload) => {
+  if (!payload || typeof payload !== 'object') {
+    return {
+      name: 'Notifikasi Sistem',
+      desc: typeof payload === 'string' ? payload : 'Pembaruan websocket diterima',
+      time: 'Baru saja',
+    };
+  }
+
+  const studentName = payload.name || payload.studentName || payload.student || payload.title;
+  const message = payload.desc || payload.message || payload.text || payload.alert || payload.status;
+
+  return {
+    name: studentName || 'Notifikasi Sistem',
+    desc: message || 'Pembaruan websocket diterima',
+    time: formatAlertTime(payload.time || payload.timestamp || payload.createdAt),
+  };
+};
+
+const INITIAL_CAMERA_BOXES = [
+  { name: "Andi Pratama", x: 12, y: 15, w: 10, h: 15, focus: true, emotion: "Senang" },
+  { name: "Budi Santoso", x: 28, y: 18, w: 9, h: 15, focus: false, emotion: "Bosan" },
+  { name: "Citra Dewi", x: 45, y: 16, w: 10, h: 15, focus: true, emotion: "Netral" },
+  { name: "Dian Sari", x: 62, y: 20, w: 9, h: 15, focus: false, emotion: "Mengantuk" },
+  { name: "Eka Putri", x: 80, y: 15, w: 10, h: 15, focus: true, emotion: "Senang" },
+  { name: "Fajar Rahman", x: 20, y: 45, w: 11, h: 18, focus: false, emotion: "Bingung" },
+  { name: "Gita Ayu", x: 48, y: 42, w: 11, h: 18, focus: true, emotion: "Netral" },
+  { name: "Hadi Wijaya", x: 74, y: 44, w: 11, h: 18, focus: true, emotion: "Senang" }
+];
+
 export default function App() {
+  const storedSession = readStoredSession();
   const [activeTab, setActiveTab] = useState('dashboard');
   const [searchQuery, setSearchQuery] = useState('');
   const [classFilter, setClassFilter] = useState('All');
   const [statusFilter, setStatusFilter] = useState('All');
   const [students, setStudents] = useState(INITIAL_STUDENTS);
   const [warnings, setWarnings] = useState(INITIAL_WARNINGS);
+  const [backendClassrooms, setBackendClassrooms] = useState([]);
+  const [backendTeachers, setBackendTeachers] = useState([]);
+  const [authToken, setAuthToken] = useState(storedSession.token);
+  const [currentUser, setCurrentUser] = useState(storedSession.user);
+  const [syncState, setSyncState] = useState(storedSession.token ? 'loading' : 'idle');
+  const [backendMessage, setBackendMessage] = useState(storedSession.token ? 'Mencoba sinkronisasi data backend...' : 'Belum login ke backend');
+  const [loginError, setLoginError] = useState('');
+  const [loginForm, setLoginForm] = useState({
+    email: '',
+    password: '',
+  });
   
   // Real-time camera feed state and canvas ref
   const canvasRef = useRef(null);
   const imgRef = useRef(null);
-  const [liveLog, setLiveLog] = useState([]);
+  const websocketRef = useRef(null);
+  const [liveLog, setLiveLog] = useState(() =>
+    INITIAL_CAMERA_BOXES.map(box => ({
+      name: box.name,
+      status: box.focus ? 'Attentive' : 'Not Attentive',
+    }))
+  );
+  const [connectionState, setConnectionState] = useState(WEB_SOCKET_URL ? 'connecting' : 'mock');
   
   // Profile settings state
   const [profileData, setProfileData] = useState({
     name: "Ahmad Dahlan, S.Pd.",
+    email: "",
+    role: "teacher",
     nip: "19670812 199203 1 002",
     school: "SMA Negeri 1 Jakarta",
     subject: "Matematika & Wali Kelas X-A",
@@ -98,7 +172,9 @@ export default function App() {
     autoRecord: true,
     pushNotification: true,
     sleepThreshold: 45,
-    unfocusThreshold: 10
+    unfocusThreshold: 10,
+    photoFilepath: '',
+    avatarInitials: 'AD'
   });
 
   const [showToast, setShowToast] = useState(false);
@@ -113,33 +189,11 @@ export default function App() {
     { name: "XII-B", value: 71, trend: "down" }
   ];
 
-  // Simulated classroom boxes (in percentage coordinates)
-  // [x, y, width, height, studentIndex]
-  const rawBoxes = [
-    { name: "Andi Pratama", x: 12, y: 15, w: 10, h: 15, focus: true, emotion: "Senang" },
-    { name: "Budi Santoso", x: 28, y: 18, w: 9, h: 15, focus: false, emotion: "Bosan" },
-    { name: "Citra Dewi", x: 45, y: 16, w: 10, h: 15, focus: true, emotion: "Netral" },
-    { name: "Dian Sari", x: 62, y: 20, w: 9, h: 15, focus: false, emotion: "Mengantuk" },
-    { name: "Eka Putri", x: 80, y: 15, w: 10, h: 15, focus: true, emotion: "Senang" },
-    { name: "Fajar Rahman", x: 20, y: 45, w: 11, h: 18, focus: false, emotion: "Bingung" },
-    { name: "Gita Ayu", x: 48, y: 42, w: 11, h: 18, focus: true, emotion: "Netral" },
-    { name: "Hadi Wijaya", x: 74, y: 44, w: 11, h: 18, focus: true, emotion: "Senang" }
-  ];
-
   // Dynamic fluctuation state for bounding boxes
-  const [boxes, setBoxes] = useState(rawBoxes);
+  const [boxes, setBoxes] = useState(INITIAL_CAMERA_BOXES);
 
   // Live Camera Feed Simulator Loop
   useEffect(() => {
-    let animationFrameId;
-    
-    // Create initial live camera result list matching the boxes
-    const results = boxes.map(b => ({
-      name: b.name,
-      status: b.focus ? "Attentive" : "Not Attentive"
-    }));
-    setLiveLog(results);
-
     // Fluctuate sizes and boxes to simulate active computer vision tracking
     const updateCoordinates = () => {
       setBoxes(prev => prev.map(box => {
@@ -162,70 +216,73 @@ export default function App() {
     const intervalId = setInterval(updateCoordinates, 150);
 
     // Every 8 seconds, simulate a student shifting attention or emotion
-    const stateIntervalId = setInterval(() => {
-      setBoxes(prev => {
-        const indexToChange = Math.floor(Math.random() * prev.length);
-        const updated = [...prev];
-        const current = updated[indexToChange];
-        
-        // Toggle focus
-        const nextFocus = !current.focus;
-        let nextEmotion = "Netral";
-        if (nextFocus) {
-          nextEmotion = Math.random() > 0.5 ? "Senang" : "Netral";
-        } else {
-          const rand = Math.random();
-          nextEmotion = rand < 0.33 ? "Bosan" : (rand < 0.66 ? "Mengantuk" : "Bingung");
-        }
-
-        updated[indexToChange] = {
-          ...current,
-          focus: nextFocus,
-          emotion: nextEmotion
-        };
-
-        // Update live results sidebar
-        setLiveLog(updated.map(b => ({
-          name: b.name,
-          status: b.focus ? "Attentive" : "Not Attentive"
-        })));
-
-        // Update main students table data if matching
-        setStudents(sPrev => sPrev.map(st => {
-          if (st.name === current.name) {
-            const diff = nextFocus ? 5 : -5;
-            const newAtt = Math.max(20, Math.min(100, st.attention + diff));
-            return {
-              ...st,
-              attention: newAtt,
-              emotion: nextEmotion,
-              trend: nextFocus ? "up" : "down"
-            };
-          }
-          return st;
-        }));
-
-        // Add warning alert if student became not attentive
-        if (!nextFocus) {
-          const timestamp = "Baru saja";
-          const alertsList = [
-            "Terdeteksi bosan",
-            "Terdeteksi bingung",
-            "Terdeteksi mengantuk",
-            "Tidak fokus > 5 menit"
-          ];
-          const randomAlertDesc = nextEmotion === "Mengantuk" ? "Terdeteksi mengantuk" : 
-                                  (nextEmotion === "Bosan" ? "Terdeteksi bosan" : alertsList[Math.floor(Math.random() * alertsList.length)]);
+    let stateIntervalId;
+    if (!WEB_SOCKET_URL) {
+      stateIntervalId = setInterval(() => {
+        setBoxes(prev => {
+          const indexToChange = Math.floor(Math.random() * prev.length);
+          const updated = [...prev];
+          const current = updated[indexToChange];
           
-          setWarnings(wPrev => [
-            { id: Date.now(), studentId: 999, name: current.name, desc: randomAlertDesc, time: timestamp },
-            ...wPrev.slice(0, 5) // Keep last 6 warnings
-          ]);
-        }
+          // Toggle focus
+          const nextFocus = !current.focus;
+          let nextEmotion = "Netral";
+          if (nextFocus) {
+            nextEmotion = Math.random() > 0.5 ? "Senang" : "Netral";
+          } else {
+            const rand = Math.random();
+            nextEmotion = rand < 0.33 ? "Bosan" : (rand < 0.66 ? "Mengantuk" : "Bingung");
+          }
 
-        return updated;
-      });
-    }, 7000);
+          updated[indexToChange] = {
+            ...current,
+            focus: nextFocus,
+            emotion: nextEmotion
+          };
+
+          // Update live results sidebar
+          setLiveLog(updated.map(b => ({
+            name: b.name,
+            status: b.focus ? "Attentive" : "Not Attentive"
+          })));
+
+          // Update main students table data if matching
+          setStudents(sPrev => sPrev.map(st => {
+            if (st.name === current.name) {
+              const diff = nextFocus ? 5 : -5;
+              const newAtt = Math.max(20, Math.min(100, st.attention + diff));
+              return {
+                ...st,
+                attention: newAtt,
+                emotion: nextEmotion,
+                trend: nextFocus ? "up" : "down"
+              };
+            }
+            return st;
+          }));
+
+          // Add warning alert if student became not attentive
+          if (!nextFocus) {
+            const timestamp = "Baru saja";
+            const alertsList = [
+              "Terdeteksi bosan",
+              "Terdeteksi bingung",
+              "Terdeteksi mengantuk",
+              "Tidak fokus > 5 menit"
+            ];
+            const randomAlertDesc = nextEmotion === "Mengantuk" ? "Terdeteksi mengantuk" : 
+                                    (nextEmotion === "Bosan" ? "Terdeteksi bosan" : alertsList[Math.floor(Math.random() * alertsList.length)]);
+            
+            setWarnings(wPrev => [
+              { id: Date.now(), studentId: 999, name: current.name, desc: randomAlertDesc, time: timestamp },
+              ...wPrev.slice(0, 5) // Keep last 6 warnings
+            ]);
+          }
+
+          return updated;
+        });
+      }, 7000);
+    }
 
     // Draw loops on canvas
     const drawCanvas = () => {
@@ -319,17 +376,175 @@ export default function App() {
 
     return () => {
       clearInterval(intervalId);
-      clearInterval(stateIntervalId);
+      if (stateIntervalId) {
+        clearInterval(stateIntervalId);
+      }
       clearInterval(animationInterval);
       window.removeEventListener('resize', drawCanvas);
     };
   }, [boxes]);
+
+  useEffect(() => {
+    if (!WEB_SOCKET_URL) {
+      return undefined;
+    }
+
+    const socket = new WebSocket(WEB_SOCKET_URL);
+    websocketRef.current = socket;
+
+    socket.onopen = () => {
+      setConnectionState('connected');
+    };
+
+    socket.onmessage = (event) => {
+      let payload = event.data;
+
+      if (typeof event.data === 'string') {
+        try {
+          payload = JSON.parse(event.data);
+        } catch {
+          payload = event.data;
+        }
+      }
+
+      const nextWarning = normalizeWebSocketWarning(payload);
+
+      setWarnings(previousWarnings => [
+        {
+          id: Date.now(),
+          studentId: payload?.studentId || payload?.id || 0,
+          name: nextWarning.name,
+          desc: nextWarning.desc,
+          time: nextWarning.time,
+        },
+        ...previousWarnings.slice(0, 5),
+      ]);
+    };
+
+    socket.onerror = () => {
+      setConnectionState('error');
+    };
+
+    socket.onclose = () => {
+      setConnectionState('closed');
+    };
+
+    return () => {
+      socket.close();
+      websocketRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    setProfileData(previousProfile => buildTeacherProfile(currentUser, previousProfile));
+  }, [currentUser]);
+
+  useEffect(() => {
+    let isActive = true;
+
+    const loadBackendData = async () => {
+      if (!authToken) {
+        setSyncState('idle');
+        setBackendMessage('Belum login ke backend');
+        return;
+      }
+
+      setSyncState('loading');
+      setBackendMessage('Mengambil siswa, kelas, dan guru dari backend...');
+
+      try {
+        const [studentsResponse, classroomsResponse, teachersResponse] = await Promise.all([
+          listCollection('/students', authToken, { page: 1, size: 100 }),
+          listCollection('/classrooms', authToken, { page: 1, size: 100 }),
+          listCollection('/teachers', authToken, { page: 1, size: 100 }),
+        ]);
+
+        if (!isActive) {
+          return;
+        }
+
+        const remoteStudents = studentsResponse?.data?.items ?? [];
+        const remoteClassrooms = classroomsResponse?.data?.items ?? [];
+        const remoteTeachers = teachersResponse?.data?.items ?? [];
+
+        const mergedStudents = mergeStudentsFromBackend(remoteStudents, INITIAL_STUDENTS);
+        const mergedBoxes = mergeBoxesFromStudents(mergedStudents, INITIAL_CAMERA_BOXES);
+
+        setStudents(mergedStudents);
+        setBoxes(mergedBoxes);
+        setBackendClassrooms(remoteClassrooms);
+        setBackendTeachers(remoteTeachers);
+        setSyncState('connected');
+        setBackendMessage(`Sinkron ${remoteStudents.length} siswa, ${remoteClassrooms.length} kelas, dan ${remoteTeachers.length} guru.`);
+      } catch (error) {
+        if (!isActive) {
+          return;
+        }
+
+        setSyncState('error');
+        setBackendMessage(error instanceof Error ? error.message : 'Gagal sinkron ke backend');
+      }
+    };
+
+    loadBackendData();
+
+    return () => {
+      isActive = false;
+    };
+  }, [authToken]);
 
   // Derived Metrics
   const totalStudentsCount = students.length;
   const focusedCount = students.filter(s => s.attention >= 70).length;
   const unfocusedCount = students.filter(s => s.attention < 70).length;
   const alertCount = warnings.length;
+  const classroomFilterOptions = backendClassrooms.length > 0
+    ? backendClassrooms.map((classroom) => classroom.name).filter(Boolean)
+    : ['X-A', 'X-B', 'XI-A', 'XI-B', 'XII-A', 'XII-B'];
+
+  const handleLoginSubmit = async (event) => {
+    event.preventDefault();
+    setLoginError('');
+    setSyncState('loading');
+    setBackendMessage('Login ke backend...');
+
+    try {
+      const response = await loginRequest(loginForm.email.trim(), loginForm.password);
+      const sessionUser = response?.data ?? null;
+      const token = sessionUser?.token ?? '';
+
+      if (!token) {
+        throw new Error('Token login tidak ditemukan.');
+      }
+
+      persistSession({ token, user: sessionUser });
+      setAuthToken(token);
+      setCurrentUser(sessionUser);
+      setLoginForm(previousForm => ({
+        ...previousForm,
+        password: '',
+      }));
+      setActiveTab('dashboard');
+      setBackendMessage('Login berhasil. Menyinkronkan data backend...');
+    } catch (error) {
+      setSyncState('error');
+      setBackendMessage('Login gagal');
+      setLoginError(error instanceof Error ? error.message : 'Login gagal');
+    }
+  };
+
+  const handleLogout = () => {
+    clearStoredSession();
+    setAuthToken('');
+    setCurrentUser(null);
+    setBackendClassrooms([]);
+    setBackendTeachers([]);
+    setSyncState('idle');
+    setBackendMessage('Belum login ke backend');
+    setStudents(INITIAL_STUDENTS);
+    setWarnings(INITIAL_WARNINGS);
+    setBoxes(INITIAL_CAMERA_BOXES);
+  };
 
   // Save Config Handlers
   const handleSaveProfile = (e) => {
@@ -655,7 +870,7 @@ export default function App() {
           onClick={() => setActiveTab('profile')}
         >
           <div className="avatar-wrapper">
-            <span style={{fontWeight: 700, fontSize: '0.85rem'}}>AD</span>
+            <span style={{fontWeight: 700, fontSize: '0.85rem'}}>{profileData.avatarInitials}</span>
           </div>
         </div>
       </aside>
@@ -682,14 +897,30 @@ export default function App() {
             </p>
           </div>
 
-          <div className="search-bar">
-            <Search size={18} color="#64748b" />
-            <input 
-              type="text" 
-              placeholder="Search Student/Class/Attention..." 
-              value={searchQuery}
-              onChange={(e) => setSearchQuery(e.target.value)}
-            />
+          <div className="header-actions">
+            <div className="search-bar">
+              <Search size={18} color="#64748b" />
+              <input 
+                type="text" 
+                placeholder="Search Student/Class/Attention..." 
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+              />
+            </div>
+
+            <div className={`connection-status connection-${connectionState}`}>
+              <span className="connection-dot" />
+              <div className="connection-copy">
+                <span className="connection-label">WebSocket</span>
+                <strong>
+                  {connectionState === 'connected' && 'Terhubung'}
+                  {connectionState === 'connecting' && 'Menghubungkan'}
+                  {connectionState === 'error' && 'Gagal konek'}
+                  {connectionState === 'closed' && 'Terputus'}
+                  {connectionState === 'mock' && 'Simulasi lokal'}
+                </strong>
+              </div>
+            </div>
           </div>
         </header>
 
@@ -761,6 +992,19 @@ export default function App() {
                   <div>
                     <h2 className="card-title">Tren Atensi Harian</h2>
                     <p className="card-subtitle">Grafik rata-rata tingkat kefokusan siswa sepanjang hari ini</p>
+
+              <div className={`connection-status connection-${syncState}`}>
+                <span className="connection-dot" />
+                <div className="connection-copy">
+                  <span className="connection-label">Backend API</span>
+                  <strong>
+                    {syncState === 'connected' && 'Tersinkron'}
+                    {syncState === 'loading' && 'Menyinkronkan'}
+                    {syncState === 'error' && 'Gagal sinkron'}
+                    {syncState === 'idle' && 'Belum login'}
+                  </strong>
+                </div>
+              </div>
                   </div>
                 </div>
                 <div style={{ height: '280px', position: 'relative' }}>
@@ -947,12 +1191,11 @@ export default function App() {
                   onChange={(e) => setClassFilter(e.target.value)}
                 >
                   <option value="All">Semua Kelas</option>
-                  <option value="X-A">Kelas X-A</option>
-                  <option value="X-B">Kelas X-B</option>
-                  <option value="XI-A">Kelas XI-A</option>
-                  <option value="XI-B">Kelas XI-B</option>
-                  <option value="XII-A">Kelas XII-A</option>
-                  <option value="XII-B">Kelas XII-B</option>
+                  {classroomFilterOptions.map((classroomName) => (
+                    <option key={classroomName} value={classroomName}>
+                      {classroomName}
+                    </option>
+                  ))}
                 </select>
 
                 {/* Status Filter */}
@@ -1217,7 +1460,7 @@ export default function App() {
               {/* Left Side: Avatar and Quick Stats */}
               <div className="profile-sidebar-card">
                 <div className="profile-avatar-large">
-                  <span>AD</span>
+                  <span>{profileData.avatarInitials}</span>
                 </div>
                 <h3 className="profile-name">{profileData.name}</h3>
                 <span className="profile-role">Guru & Operator AI</span>
@@ -1253,6 +1496,68 @@ export default function App() {
 
               {/* Right Side: Form fields and Configuration */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: '28px' }}>
+                <div className="profile-details-card">
+                  <h3 className="profile-section-title">
+                    <Settings size={18} color="#6366f1" />
+                    <span>Sinkronisasi Backend</span>
+                  </h3>
+
+                  <p className="card-subtitle" style={{ marginBottom: '16px' }}>
+                    {backendMessage}
+                  </p>
+
+                  {!authToken ? (
+                    <form onSubmit={handleLoginSubmit}>
+                      <div className="profile-fields-grid">
+                        <div className="profile-field-group">
+                          <label>Email Login</label>
+                          <input
+                            type="email"
+                            placeholder="guru@sekolah.id"
+                            value={loginForm.email}
+                            onChange={(event) => setLoginForm(previousForm => ({ ...previousForm, email: event.target.value }))}
+                          />
+                        </div>
+                        <div className="profile-field-group">
+                          <label>Password</label>
+                          <input
+                            type="password"
+                            placeholder="Masukkan password"
+                            value={loginForm.password}
+                            onChange={(event) => setLoginForm(previousForm => ({ ...previousForm, password: event.target.value }))}
+                          />
+                        </div>
+                      </div>
+
+                      {loginError && (
+                        <div style={{ color: '#ef4444', marginTop: '12px', fontWeight: 600 }}>
+                          {loginError}
+                        </div>
+                      )}
+
+                      <div style={{ display: 'flex', gap: '12px', marginTop: '18px', flexWrap: 'wrap' }}>
+                        <button type="submit" className="save-btn" disabled={syncState === 'loading'}>
+                          {syncState === 'loading' ? 'Login...' : 'Login ke Backend'}
+                        </button>
+                      </div>
+                    </form>
+                  ) : (
+                    <div style={{ display: 'flex', flexDirection: 'column', gap: '14px' }}>
+                      <div style={{ display: 'grid', gap: '8px' }}>
+                        <div style={{ fontSize: '0.9rem', color: '#64748b', fontWeight: 600 }}>User aktif</div>
+                        <div style={{ fontSize: '1rem', fontWeight: 700, color: '#1e1b4b' }}>{profileData.name}</div>
+                        <div style={{ fontSize: '0.92rem', color: '#64748b' }}>{profileData.email || 'Email tidak tersedia'}</div>
+                        <div style={{ fontSize: '0.92rem', color: '#64748b' }}>{backendTeachers.length} guru, {backendClassrooms.length} kelas tersinkron</div>
+                      </div>
+
+                      <div style={{ display: 'flex', gap: '12px', flexWrap: 'wrap' }}>
+                        <button type="button" className="save-btn" onClick={handleLogout} style={{ background: '#ef4444' }}>
+                          Logout
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
                 
                 {/* School Information */}
                 <div className="profile-details-card">
