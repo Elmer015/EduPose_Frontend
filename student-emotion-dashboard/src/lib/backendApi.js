@@ -1,4 +1,4 @@
-const DEFAULT_API_BASE_URL = 'http://localhost:8000';
+const DEFAULT_API_BASE_URL = '/api';
 
 export const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL?.trim() || DEFAULT_API_BASE_URL).replace(/\/$/, '');
 
@@ -104,6 +104,16 @@ export const loginRequest = (email, password) => {
       'Content-Type': 'application/json',
     },
   });
+};
+
+export const checkBackendHealth = async () => {
+  const response = await fetch(buildApiUrl('/'));
+
+  if (!response.ok) {
+    throw new Error(`Backend health check failed with status ${response.status}`);
+  }
+
+  return response.json();
 };
 
 export const listCollection = (resourcePath, token, params = {}) => {

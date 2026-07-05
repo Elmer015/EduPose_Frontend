@@ -36,6 +36,7 @@ import {
 } from 'chart.js';
 import {
   buildTeacherProfile,
+  checkBackendHealth,
   clearStoredSession,
   listCollection,
   loginRequest,
@@ -139,6 +140,8 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(storedSession.user);
   const [syncState, setSyncState] = useState(storedSession.token ? 'loading' : 'idle');
   const [backendMessage, setBackendMessage] = useState(storedSession.token ? 'Mencoba sinkronisasi data backend...' : 'Belum login ke backend');
+  const [backendHealthState, setBackendHealthState] = useState('checking');
+  const [backendHealthMessage, setBackendHealthMessage] = useState('Memeriksa backend...');
   const [loginError, setLoginError] = useState('');
   const [loginForm, setLoginForm] = useState({
     email: '',
@@ -438,6 +441,39 @@ export default function App() {
   useEffect(() => {
     setProfileData(previousProfile => buildTeacherProfile(currentUser, previousProfile));
   }, [currentUser]);
+
+  useEffect(() => {
+    let isActive = true;
+
+    const verifyBackendHealth = async () => {
+      setBackendHealthState('checking');
+      setBackendHealthMessage('Memeriksa backend...');
+
+      try {
+        await checkBackendHealth();
+
+        if (!isActive) {
+          return;
+        }
+
+        setBackendHealthState('online');
+        setBackendHealthMessage('Backend aktif');
+      } catch (error) {
+        if (!isActive) {
+          return;
+        }
+
+        setBackendHealthState('offline');
+        setBackendHealthMessage(error instanceof Error ? error.message : 'Backend tidak dapat dijangkau');
+      }
+    };
+
+    verifyBackendHealth();
+
+    return () => {
+      isActive = false;
+    };
+  }, []);
 
   useEffect(() => {
     let isActive = true;
@@ -993,19 +1029,19 @@ export default function App() {
                     <h2 className="card-title">Tren Atensi Harian</h2>
                     <p className="card-subtitle">Grafik rata-rata tingkat kefokusan siswa sepanjang hari ini</p>
 
-              <div className={`connection-status connection-${syncState}`}>
+              <div className={`connection-status connection-${backendHealthState === 'online' ? 'connected' : backendHealthState === 'checking' ? 'connecting' : 'error'}`}>
                 <span className="connection-dot" />
                 <div className="connection-copy">
                   <span className="connection-label">Backend API</span>
                   <strong>
-                    {syncState === 'connected' && 'Tersinkron'}
-                    {syncState === 'loading' && 'Menyinkronkan'}
-                    {syncState === 'error' && 'Gagal sinkron'}
-                    {syncState === 'idle' && 'Belum login'}
+                    {backendHealthState === 'online' && 'Backend aktif'}
+                    {backendHealthState === 'checking' && 'Memeriksa'}
+                    {backendHealthState === 'offline' && 'Backend tidak aktif'}
                   </strong>
                 </div>
               </div>
                   </div>
+                  <p className="card-subtitle" style={{ marginTop: '6px' }}>{backendHealthMessage}</p>
                 </div>
                 <div style={{ height: '280px', position: 'relative' }}>
                   <Line data={dailyAttentionData} options={dailyAttentionOptions} />
